@@ -887,6 +887,77 @@ private void ToggleShadowVisibility()
         return obs.ToArray();
     }
 
+    /// <summary>
+    /// Binds the neural network's action space (a_L) to the physical joint PD controllers.
+    /// Maps normalized continuous actions [-1, 1] to target orientations bounded by physical limits.
+    /// </summary>
+    public void ApplyActions(float[] actions, float dt)
+    {
+        if (_hips == null) return;
+
+        int actionIndex = 0;
+
+        foreach (var m in _muscles)
+        {
+            // The root bone (hips) is driven by the environment, not a parent joint constraint.
+            if (m.Bone == _hips || m.ParentBone == null) continue;
+
+            // Ensure we do not overflow the action array
+            if (actionIndex + 2 >= actions.Length) break;
+
+            // 1. Read normalized actions [-1, 1] from the DeepLoco LLC
+            float actX = actions[actionIndex++];
+            float actY = actions[actionIndex++];
+            float actZ = actions[actionIndex++];
+
+            // 2. Map normalized actions to physical joint limits
+            // Action parameters are clamped to stay within permissible ranges of motion.
+            float limitX = (float)m.Bone.Get("joint_constraints/angular_limit_x/upper_angle");
+            float limitY = (float)m.Bone.Get("joint_constraints/angular_limit_y/upper_angle");
+            float limitZ = (float)m.Bone.Get("joint_constraints/angular_limit_z/upper_angle");
+
+            Vector3 targetEuler = new Vector3(
+                Mathf.Clamp(actX, -1f, 1f) * limitX,
+                Mathf.Clamp(actY, -1f, 1f) * limitY,
+                Mathf.Clamp(actZ, -1f, 1f) * limitZ
+            );
+
+            // Construct the target local orientation requested by the LLC
+            Quaternion targetLocalQ = Quaternion.FromEuler(targetEuler);
+
+            // 3. PD Control Law Execution
+            // Calculate current local rotation relative to the parent bone
+            Quaternion parentWorldQ = m.ParentBone.GlobalBasis.GetRotationQuaternion();
+            Quaternion currentWorldQ = m.Bone.GlobalBasis.GetRotationQuaternion();
+            Quaternion currentLocalQ = parentWorldQ.Inverse() * currentWorldQ;
+
+            // Calculate rotational difference
+            Quaternion diff = targetLocalQ * currentLocalQ.Inverse();
+            if (diff.W < 0f) diff = new Quaternion(-diff.X, -diff.Y, -diff.Z, -diff.W);
+
+            Vector3 axis = diff.GetAxis().Normalized();
+            float angle = diff.GetAngle();
+            if (float.IsNaN(angle)) continue;
+
+            // P-Term: Proportional stiffness pushing toward the target angle
+            Vector3 pTerm = (axis * angle) * MuscleStiffness;
+
+            // D-Term: Derivative damping relative to the parent bone's velocity
+            Vector3 relativeVel = m.Bone.AngularVelocity - m.ParentBone.AngularVelocity;
+            Vector3 dTerm = relativeVel * MuscleDamping;
+
+            Vector3 rawTorque = pTerm - dTerm;
+
+            // 4. Physical Safeguards
+            float limit = MaxMuscleTorque;
+            if (m.IsSpine) limit *= 5.0f;
+            if (m.IsArm) limit *= 0.2f;
+
+            // Apply the final clamped torque to the bone and equal opposite torque to the parent
+            ApplyTorque(m.Bone, rawTorque.LimitLength(limit), dt, m.ParentBone);
+        }
+    }
+
     public override void _PhysicsProcess(double delta)
     {
       if (!_isActive || _sim == null || !_sim.Active || _hips == null) return;
@@ -971,7 +1042,12 @@ private void ToggleShadowVisibility()
       // have been removed. The DeepLoco LLC will dictate joint targets.
       CompensateForGravity(dt);
 
-      // TODO: Apply neural network actions (a_L) to joint PD controllers here.
+      // TODO (Phase 4): Godot RL Agents will inject the actual action tensor here.
+      // For now, we simulate a neutral zero-action array to test the PD limits.
+      int requiredActionSize = (_muscles.Count - 1) * 3;
+      float[] currentActions = new float[requiredActionSize];
+
+      ApplyActions(currentActions, dt);
 
       if (DrawDebugGizmos) DrawGizmos();
     }
