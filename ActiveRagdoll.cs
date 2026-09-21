@@ -78,12 +78,14 @@ namespace NoCAPTheorem.Virtual
     // --- INTERNAL STATE ---
     private float _airborneTimer = 0.0f;
     private float _gaitPhase = 0.0f; // Tracks the 0.0 to 1.0 gait cycle
-
-    // --- INTERNAL STATE ---
     private bool _isActive = true;
     private bool _wasFallen = false;
     private int _frameCounter = 0;
     private bool _isShadowVisible = true;
+
+    // --- LLC INTERMEDIATE GOALS (g_L) ---
+    public Vector3 TargetFootstep0 = Vector3.Forward * 0.4f; // p_0 target
+    public float TargetRootHeading = 0.0f; // theta_root target
 
     // --- DATA STRUCTURES ---
     private List<MuscleGroup> _muscles = new List<MuscleGroup>();
@@ -819,7 +821,8 @@ private void ToggleShadowVisibility()
       SpawnImpactText(impactPosition);
     }
 
-    private void ResetSimulation() {
+    private void ResetSimulation()
+    {
       if (_sim == null) return;
       _sim.Active = false;
       foreach(var m in _muscles) {
@@ -829,6 +832,65 @@ private void ToggleShadowVisibility()
         PhysicsServer3D.BodySetState(m.Bone.GetRid(), PhysicsServer3D.BodyState.AngularVelocity, Vector3.Zero);
       }
       CallDeferred(nameof(StartPhysics));
+    }
+
+    /// <summary>
+    /// Evaluates if the agent has fallen.
+    /// An episode is terminated early if the torso contacts the ground.
+    /// </summary>
+    public bool CheckIfDone()
+    {
+        if (_hips == null) return false;
+
+        var spaceState = GetWorld3D().DirectSpaceState;
+        var query = PhysicsRayQueryParameters3D.Create(_hips.GlobalPosition, _hips.GlobalPosition + (Vector3.Down * 10.0f));
+        query.CollisionMask = GroundMask;
+        var result = spaceState.IntersectRay(query);
+
+        float trueHeightAboveGround = TargetHeight;
+        if (result.Count > 0)
+        {
+            trueHeightAboveGround = _hips.GlobalPosition.Y - result["position"].AsVector3().Y;
+        }
+
+        // 0.45f represents the FallenHeight threshold
+        return trueHeightAboveGround < FallenHeight;
+    }
+
+    /// <summary>
+    /// Computes the multi-objective reward (r_L) per 30 Hz step.
+    /// </summary>
+    public float CalculateReward()
+    {
+        if (_hips == null || AnimationShadow == null) return 0f;
+
+        // 1. Style Similarity (r_pose)
+        // Penalizes deviation from the reference motion capture pose
+        float poseError = 0f;
+        foreach (var m in _muscles)
+        {
+            Quaternion simQ = m.Bone.GlobalBasis.GetRotationQuaternion();
+            Quaternion animQ = (AnimationShadow.GlobalTransform * AnimationShadow.GetBoneGlobalPose(m.BoneId)).Basis.GetRotationQuaternion();
+            poseError += Mathf.Abs(simQ.AngleTo(animQ));
+        }
+        float r_pose = Mathf.Exp(-2.0f * (poseError / _muscles.Count));
+
+        // 2. Root Heading Accuracy (r_root)
+        // Penalizes deviation from the target walking direction
+        Vector3 hipForward = -_hips.GlobalBasis.Z;
+        float currentHeading = Mathf.Atan2(hipForward.X, hipForward.Z);
+        float headingError = Mathf.Abs(currentHeading - TargetRootHeading);
+        float r_root = Mathf.Exp(-5.0f * headingError);
+
+        // 3. Footstep Placement Accuracy (r_step)
+        // Evaluates the distance of the active swing foot to the target placement
+        Vector3 swingFootPos = _legs[0].GroundedConfidence < _legs[1].GroundedConfidence ?
+                               _legs[0].Foot.GlobalPosition : _legs[1].Foot.GlobalPosition;
+        float stepError = new Vector2(swingFootPos.X - TargetFootstep0.X, swingFootPos.Z - TargetFootstep0.Z).Length();
+        float r_step = Mathf.Exp(-stepError);
+
+        // Weighted summation of the multi-objective reward
+        return (0.5f * r_pose) + (0.3f * r_root) + (0.2f * r_step);
     }
 
     /// <summary>
@@ -1213,7 +1275,7 @@ private void ToggleShadowVisibility()
         Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
         PixelSize = 0.005f
       };
-      _effectRoot.AddChild(newLabel);
+      _effectRoot?.AddChild(newLabel);
       _effectPool.Add(newLabel);
       return newLabel;
     }
