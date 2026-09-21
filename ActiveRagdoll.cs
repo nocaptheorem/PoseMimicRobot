@@ -77,6 +77,7 @@ namespace NoCAPTheorem.Virtual
 
     // --- INTERNAL STATE ---
     private float _airborneTimer = 0.0f;
+    private float _gaitPhase = 0.0f; // Tracks the 0.0 to 1.0 gait cycle
 
     // --- INTERNAL STATE ---
     private bool _isActive = true;
@@ -830,6 +831,62 @@ private void ToggleShadowVisibility()
       CallDeferred(nameof(StartPhysics));
     }
 
+    /// <summary>
+    /// Constructs the state space (s_L) for the DeepLoco LLC neural network.
+    /// Returns a flattened array of Phase (1), Foot Contacts (2), and Bone Kinematics (N * 13).
+    /// </summary>
+    public float[] CollectObservations()
+    {
+        List<float> obs = new List<float>();
+
+        // 1. Phase Variable (1D)
+        // Keeps the LLC in sync with the 1-second reference motion cycle.
+        obs.Add(_gaitPhase);
+
+        // 2. Contact Sensors (2D)
+        // Binary indicators (1.0 or 0.0) for foot ground contact.
+        foreach (var leg in _legs)
+        {
+            obs.Add(leg.GroundSensor.IsColliding() ? 1.0f : 0.0f);
+        }
+
+        // 3. Proprioception (Bone Kinematics)
+        if (_hips == null) return obs.ToArray();
+
+        Transform3D rootTransform = _hips.GlobalTransform;
+        Basis rootBasisInv = rootTransform.Basis.Inverse();
+
+        foreach (var m in _muscles)
+        {
+            // Center of Mass Position (3D): Relative to the root/pelvis
+            Vector3 relPos = rootBasisInv * (m.Bone.GlobalPosition - rootTransform.Origin);
+            obs.Add(relPos.X);
+            obs.Add(relPos.Y);
+            obs.Add(relPos.Z);
+
+            // Relative Rotation (4D): Quaternions relative to the root orientation
+            Quaternion relRot = (rootBasisInv * m.Bone.GlobalBasis).GetRotationQuaternion();
+            obs.Add(relRot.X);
+            obs.Add(relRot.Y);
+            obs.Add(relRot.Z);
+            obs.Add(relRot.W);
+
+            // Linear Velocity (3D): Transformed to the root's local coordinate frame
+            Vector3 locLinVel = rootBasisInv * m.Bone.LinearVelocity;
+            obs.Add(locLinVel.X);
+            obs.Add(locLinVel.Y);
+            obs.Add(locLinVel.Z);
+
+            // Angular Velocity (3D): Transformed to the root's local coordinate frame
+            Vector3 locAngVel = rootBasisInv * m.Bone.AngularVelocity;
+            obs.Add(locAngVel.X);
+            obs.Add(locAngVel.Y);
+            obs.Add(locAngVel.Z);
+        }
+
+        return obs.ToArray();
+    }
+
     public override void _PhysicsProcess(double delta)
     {
       if (!_isActive || _sim == null || !_sim.Active || _hips == null) return;
@@ -851,6 +908,8 @@ private void ToggleShadowVisibility()
 
       float dt = (float)delta;
       if (dt <= 0f) return;
+      _gaitPhase += dt;
+      if (_gaitPhase >= 1.0f) _gaitPhase -= 1.0f;
 
       _frameCounter++;
       bool isDebugFrame = EnableDebugLogs && (_frameCounter % 60 == 0);
