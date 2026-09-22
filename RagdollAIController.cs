@@ -3,9 +3,6 @@ using Godot.Collections;
 
 namespace ActiveRagdollModules
 {
-    /// <summary>
-    /// The Godot RL Agents interface for the DeepLoco Low-Level Controller (LLC).
-    /// </summary>
     public partial class RagdollAIController : AIController3D
     {
         [Export] public NoCAPTheorem.Virtual.ActiveRagdoll Ragdoll = null!;
@@ -13,42 +10,70 @@ namespace ActiveRagdollModules
         public override void _Ready()
         {
             base._Ready();
-            if (Ragdoll == null) GD.PrintErr("[RagdollAIController] Ragdoll reference missing! Assign it in the inspector.");
+            AddToGroup("AGENT");
+            if (Ragdoll == null) GD.PrintErr("[RagdollAIController] Ragdoll reference missing!");
         }
 
-        public override Dictionary GetObs()
+        public override Dictionary get_obs_space()
         {
-            // Gathers the 110D state space containing phase, contacts, and proprioception
+            var dict = new Dictionary();
+            int obsSize = Ragdoll.CollectObservations().Length;
+
+            // godot_rl expects OBSERVATION size to be an array
+            dict["obs"] = new Dictionary { { "size", new int[] { obsSize } }, { "space", "box" } };
+            return dict;
+        }
+
+        public override Dictionary get_action_space()
+        {
+            var dict = new Dictionary();
+
+            // godot_rl expects ACTION size to be a raw integer
+            dict["action"] = new Dictionary { { "size", 72 }, { "action_type", "continuous" } };
+            return dict;
+        }
+
+        public override Dictionary get_info()
+        {
+            return new Dictionary();
+        }
+
+        public override void zero_reward()
+        {
+        }
+
+        public override Dictionary get_obs()
+        {
             float[] obs = Ragdoll.CollectObservations();
             var dict = new Dictionary();
             dict["obs"] = obs;
             return dict;
         }
 
-        public override float GetReward()
+        public override float get_reward()
         {
-            // Calculates the multi-objective reward (r_step, r_root, r_pose)
             return Ragdoll.CalculateReward();
         }
 
-        public override void SetAction(Dictionary action)
+        public override void set_action(Dictionary action)
         {
-          // Converts the incoming Python tensor into a C# float array and applies physical torques
-          var actionVariant = action["action"].AsFloat32Array();
-          float dt = (float)GetPhysicsProcessDeltaTime();
-          Ragdoll.ApplyActions(actionVariant, dt);
+            var actionVariant = action["action"].AsFloat32Array();
+            float dt = (float)GetPhysicsProcessDeltaTime();
+            Ragdoll.ApplyActions(actionVariant, dt);
         }
 
-        public override bool GetDone()
+        public override bool get_done()
         {
-            // Terminates the episode if the torso hits the floor
             return Ragdoll.CheckIfDone();
         }
 
-        public override void Reset()
+        public override void reset()
         {
-            // Resets the physical joints to the default upright stance upon failure
             Ragdoll.Call("ResetSimulation");
+        }
+
+        public override void set_done_false()
+        {
         }
     }
 }

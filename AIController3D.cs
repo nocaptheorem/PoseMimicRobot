@@ -3,35 +3,34 @@ using Godot.Collections;
 
 namespace ActiveRagdollModules
 {
-    /// <summary>
-    /// Base class for Godot RL Agents C# integration.
-    /// The external GDScript Sync node will duck-type call these methods using Godot's reflection.
-    /// </summary>
     public abstract partial class AIController3D : Node3D
     {
-        /// <summary>
-        /// Returns the continuous state space array (s_L) to the Python environment.
-        /// </summary>
-        public abstract Dictionary GetObs();
+        [Export]
+        public Dictionary ControlModes { get; set; } = new Dictionary
+        {
+            { "HUMAN", 0 },
+            { "ONNX", 1 },
+            { "TRAINING", 2 },
+            { "INHERIT_FROM_SYNC", 3 } // ADDED: New sync state
+        };
 
-        /// <summary>
-        /// Returns the scalar reward (r_L) for the current step.
-        /// </summary>
-        public abstract float GetReward();
+        [Export] public int control_mode { get; set; } = 2;
+        [Export] public string policy_name { get; set; } = "default";
 
-        /// <summary>
-        /// Receives the continuous action tensor (a_L) from the Python policy and applies it.
-        /// </summary>
-        public abstract void SetAction(Dictionary action);
+        // FIXED: Expose the reset flag required by sync.gd during episode restarts
+        [Export] public bool needs_reset { get; set; } = false;
 
-        /// <summary>
-        /// Evaluates if the episode has reached a terminal state (e.g., falling over).
-        /// </summary>
-        public abstract bool GetDone();
+        public virtual void set_heuristic(string heuristic) {}
 
-        /// <summary>
-        /// Resets the environment and agent state when an episode terminates.
-        /// </summary>
-        public abstract void Reset();
+        public abstract Dictionary get_obs();
+        public abstract float get_reward();
+        public abstract void set_action(Dictionary action);
+        public abstract bool get_done();
+        public abstract void reset();
+        public abstract Dictionary get_obs_space();
+        public abstract Dictionary get_action_space();
+        public abstract Dictionary get_info();
+        public abstract void zero_reward();
+        public abstract void set_done_false();
     }
 }
