@@ -83,6 +83,10 @@ namespace NoCAPTheorem.Virtual
   #endregion
 
 	// --- INTERNAL STATE ---
+  private Vector2 _targetFootstep0;
+  private Vector2 _targetFootstep1;
+  private Vector2 _worldTargetP1; // Caches p1 in world horizontal coordinates (X, Z)
+  private bool _hasInitialPlan = false;
 	private Vector3 _initialSpawnPosition;
 	private Vector3 _initialSpawnRotation;
 	private bool _needsSimulatorRestart = false;
@@ -247,6 +251,83 @@ namespace NoCAPTheorem.Virtual
 	  }
 	}
 
+
+  private void GenerateFootstepGoals()
+  {
+    if (_hips == null) return;
+
+    // Current pelvis planar transform
+    Vector3 hipPos = _hips.GlobalPosition;
+    Vector3 hipForward = -_hips.GlobalBasis.Z;
+    float currentHeading = Mathf.Atan2(hipForward.X, hipForward.Z);
+
+    float strideLength = 0.4f;
+    float strideWidth = 0.2f;
+    bool isLeftStance = _gaitPhase < 0.5f;
+    float nextLateral = isLeftStance ? -strideWidth : strideWidth;
+
+    if (!_hasInitialPlan)
+    {
+      // Cold start (Episode Reset / Spawn)
+      TargetRootHeading = currentHeading + (float)_rng.Randfn(0.0f, 0.25f);
+
+      float localX0 = isLeftStance ? strideWidth : -strideWidth;
+      float localZ0 = -strideLength;
+      _targetFootstep0 = new Vector2(localX0, localZ0);
+
+      // Calculate p1 relative to root
+      float dTheta = TargetRootHeading - currentHeading;
+      float cosT = Mathf.Cos(dTheta);
+      float sinT = Mathf.Sin(dTheta);
+      Vector2 fwdDir = new Vector2(-sinT, -cosT);
+      Vector2 rgtDir = new Vector2(cosT, -sinT);
+
+      _targetFootstep1 = new Vector2(0f, localZ0) + (fwdDir * strideLength) + (rgtDir * nextLateral);
+
+      // Store p1 in horizontal world coordinates (Godot X, Z)
+      float cosH = Mathf.Cos(currentHeading);
+      float sinH = Mathf.Sin(currentHeading);
+      _worldTargetP1 = new Vector2(hipPos.X, hipPos.Z) + new Vector2(
+          _targetFootstep1.X * cosH - _targetFootstep1.Y * sinH,
+          _targetFootstep1.X * sinH + _targetFootstep1.Y * cosH
+          );
+
+      _hasInitialPlan = true;
+      return;
+    }
+
+    // --- SEQUENTIAL STEP TRANSITION (DeepLoco Equation 13) ---
+    // 1. Inherit p0 from previous p1 by transforming worldTargetP1 into current root frame
+    Vector2 deltaWorld = _worldTargetP1 - new Vector2(hipPos.X, hipPos.Z);
+    float cosInv = Mathf.Cos(-currentHeading);
+    float sinInv = Mathf.Sin(-currentHeading);
+    _targetFootstep0 = new Vector2(
+        deltaWorld.X * cosInv - deltaWorld.Y * sinInv,
+        deltaWorld.X * sinInv + deltaWorld.Y * cosInv
+        );
+
+    // 2. Update heading target: theta_root^k = theta_root^{k-1} + N(0, 0.25^2)
+    TargetRootHeading = currentHeading + (float)_rng.Randfn(0.0f, 0.25f);
+
+    // 3. Extrapolate p1^k = p0^k + delta_p(theta_root^k)
+    float deltaTheta = TargetRootHeading - currentHeading;
+    float cosRel = Mathf.Cos(deltaTheta);
+    float sinRel = Mathf.Sin(deltaTheta);
+
+    Vector2 stepForward = new Vector2(-sinRel, -cosRel);
+    Vector2 stepRight = new Vector2(cosRel, -sinRel);
+
+    _targetFootstep1 = _targetFootstep0 + (stepForward * strideLength) + (stepRight * nextLateral);
+
+    // 4. Cache new p1 in world space for next step boundary
+    float cosHead = Mathf.Cos(currentHeading);
+    float sinHead = Mathf.Sin(currentHeading);
+    _worldTargetP1 = new Vector2(hipPos.X, hipPos.Z) + new Vector2(
+        _targetFootstep1.X * cosHead - _targetFootstep1.Y * sinHead,
+        _targetFootstep1.X * sinHead + _targetFootstep1.Y * cosHead
+        );
+  }
+
 	public override void _Ready()
 	{
 	// 1. Fetch AnimationPlayer if not assigned in Inspector
@@ -255,13 +336,11 @@ namespace NoCAPTheorem.Virtual
 	  ShadowAnimPlayer = GetNodeOrNull<AnimationPlayer>("../AnimationPlayer");
 	}
 
-	// 2. Force loop and play
-	if (ShadowAnimPlayer != null && ShadowAnimPlayer.HasAnimation("Walking/mixamo_com"))
-	{
-	  var anim = ShadowAnimPlayer.GetAnimation("Walking/mixamo_com");
-	  anim.LoopMode = Godot.Animation.LoopModeEnum.Linear;
-	  ShadowAnimPlayer.Play("Walking/mixamo_com");
-	}
+  if (ShadowAnimPlayer != null && ShadowAnimPlayer.HasAnimation("Walking/mixamo_com"))
+  {
+    ShadowAnimPlayer.Play("Walking/mixamo_com");
+    ShadowAnimPlayer.SpeedScale = 0.0f; // Freeze auto-playback; we will drive it via Seek()
+  }
 
 	// 3. Existing initialization
 	  if (AnimationShadow != null)
@@ -862,42 +941,50 @@ namespace NoCAPTheorem.Virtual
 
   public void ResetSimulation()
   {
-	if (_sim == null) return;
+    if (_sim == null) return;
+    _sim.Active = false;
+    _sim.PhysicalBonesStopSimulation();
 
-	_sim.Active = false;
-	_sim.PhysicalBonesStopSimulation();
+    _gaitPhase = 0.0f;
+    _airborneTimer = 0.0f;
 
-	_gaitPhase = 0.0f;
-	_airborneTimer = 0.0f;
+    // Reset the shadow to the exact center of the world facing forward
+    if (AnimationShadow != null)
+    {
+      AnimationShadow.GlobalPosition = Vector3.Zero;
+      AnimationShadow.GlobalRotation = Vector3.Zero;
 
-	if (AnimationShadow != null)
-	{
-	  // Do NOT disrupt the AnimationShadow.
-	  // Instead, snap the ActiveRagdoll to the shadow's current position and rotation.
-	  this.GlobalPosition = AnimationShadow.GlobalPosition;
-	  this.GlobalRotation = AnimationShadow.GlobalRotation;
-	}
+      // Force the animation back to frame 0 immediately
+      if (ShadowAnimPlayer != null) {
+        ShadowAnimPlayer.Seek(0.0f, true);
+      }
+    }
 
-	for (int i = 0; i < GetBoneCount(); i++)
-	{
-	  SetBonePosePosition(i, AnimationShadow.GetBonePosePosition(i));
-	  SetBonePoseRotation(i, AnimationShadow.GetBonePoseRotation(i));
-	  SetBonePoseScale(i, AnimationShadow.GetBonePoseScale(i));
-	}
+    // Snap ragdoll to the newly zeroed shadow
+    this.GlobalPosition = Vector3.Zero;
+    this.GlobalRotation = Vector3.Zero;
+    for (int i = 0; i < GetBoneCount(); i++)
+    {
+      SetBonePosePosition(i, AnimationShadow.GetBonePosePosition(i));
+      SetBonePoseRotation(i, AnimationShadow.GetBonePoseRotation(i));
+      SetBonePoseScale(i, AnimationShadow.GetBonePoseScale(i));
+    }
 
-	ForceUpdateAllBoneTransforms();
+    ForceUpdateAllBoneTransforms();
 
-	foreach (var m in _muscles)
-	{
-	  Transform3D t = AnimationShadow.GetBoneGlobalPose(m.BoneId);
-	  Transform3D standingTransform = AnimationShadow.GlobalTransform * t;
+    foreach (var m in _muscles)
+    {
+      Transform3D t = AnimationShadow.GetBoneGlobalPose(m.BoneId);
+      Transform3D standingTransform = AnimationShadow.GlobalTransform * t;
 
-	  m.Bone.GlobalTransform = standingTransform;
-	  m.Bone.LinearVelocity = Vector3.Zero;
-	  m.Bone.AngularVelocity = Vector3.Zero;
-	}
+      m.Bone.GlobalTransform = standingTransform;
+      m.Bone.LinearVelocity = Vector3.Zero;
+      m.Bone.AngularVelocity = Vector3.Zero;
+    }
 
-	_pendingPhysicsTeleport = true;
+    _pendingPhysicsTeleport = true;
+    _hasInitialPlan = false;
+    GenerateFootstepGoals();
   }
 
 	private void ExecutePhysicsTeleport()
@@ -965,13 +1052,19 @@ namespace NoCAPTheorem.Virtual
 		Vector3 hipForward = -_hips.GlobalBasis.Z;
 		float currentHeading = Mathf.Atan2(hipForward.X, hipForward.Z);
 		float headingError = Mathf.Abs(currentHeading - TargetRootHeading);
-		float r_root = Mathf.Exp(-5.0f * headingError);
+    float r_root = 0.5f * Mathf.Cos(TargetRootHeading - currentHeading) + 0.5f;
 
 		// 3. Footstep Placement Accuracy (r_step)
 		// Evaluates the distance of the active swing foot to the target placement
 		Vector3 swingFootPos = _legs[0].GroundedConfidence < _legs[1].GroundedConfidence ?
 							   _legs[0].Foot.GlobalPosition : _legs[1].Foot.GlobalPosition;
-		float stepError = new Vector2(swingFootPos.X - TargetFootstep0.X, swingFootPos.Z - TargetFootstep0.Z).Length();
+
+		// Transform global swing foot position into the root's local coordinate frame
+		Vector3 localSwingFoot = _hips.GlobalBasis.Inverse() * (swingFootPos - _hips.GlobalPosition);
+
+		// Calculate 2D planar error against dynamic _targetFootstep0
+		// Note: _targetFootstep0.Y stores the forward distance, mapping to the 3D local Z-axis
+		float stepError = new Vector2(localSwingFoot.X - _targetFootstep0.X, localSwingFoot.Z - _targetFootstep0.Y).Length();
 		float r_step = Mathf.Exp(-stepError);
 
 		// Weighted summation of the multi-objective reward
@@ -982,57 +1075,55 @@ namespace NoCAPTheorem.Virtual
 	/// Constructs the state space (s_L) for the DeepLoco LLC neural network.
 	/// Returns a flattened array of Phase (1), Foot Contacts (2), and Bone Kinematics (N * 13).
 	/// </summary>
-	public float[] CollectObservations()
-	{
-		List<float> obs = new List<float>();
+  public float[] CollectObservations()
+  {
+    List<float> obs = new List<float>();
 
-		// 1. Phase Variable (1D)
-		// Keeps the LLC in sync with the 1-second reference motion cycle.
-		obs.Add(_gaitPhase);
+    // 1. Goal Features (g_L)
+    obs.Add(_targetFootstep0.X);
+    obs.Add(_targetFootstep0.Y);
+    obs.Add(_targetFootstep1.X);
+    obs.Add(_targetFootstep1.Y);
+    obs.Add(TargetRootHeading);
 
-		// 2. Contact Sensors (2D)
-		// Binary indicators (1.0 or 0.0) for foot ground contact.
-		foreach (var leg in _legs)
-		{
-			obs.Add(leg.GroundSensor.IsColliding() ? 1.0f : 0.0f);
-		}
+    // 2. Phase & Contacts
+    // Map global gait phase (0..1) to progress within the current quadrant (0..1)
+    float intraQuadrantPhase = (_gaitPhase * 4.0f) % 1.0f;
+    obs.Add(intraQuadrantPhase);
 
-		// 3. Proprioception (Bone Kinematics)
-		if (_hips == null) return obs.ToArray();
+    foreach (var leg in _legs) obs.Add(leg.GroundSensor.IsColliding() ? 1.0f : 0.0f);
 
-		Transform3D rootTransform = _hips.GlobalTransform;
-		Basis rootBasisInv = rootTransform.Basis.Inverse();
+    // 3. Proprioception
+    if (_hips != null)
+    {
+      Transform3D rootTransform = _hips.GlobalTransform;
+      Basis rootBasisInv = rootTransform.Basis.Inverse();
 
-		foreach (var m in _muscles)
-		{
-			// Center of Mass Position (3D): Relative to the root/pelvis
-			Vector3 relPos = rootBasisInv * (m.Bone.GlobalPosition - rootTransform.Origin);
-			obs.Add(relPos.X);
-			obs.Add(relPos.Y);
-			obs.Add(relPos.Z);
+      foreach (var m in _muscles)
+      {
+        Vector3 relPos = rootBasisInv * (m.Bone.GlobalPosition - rootTransform.Origin);
+        obs.Add(relPos.X); obs.Add(relPos.Y); obs.Add(relPos.Z);
 
-			// Relative Rotation (4D): Quaternions relative to the root orientation
-			Quaternion relRot = (rootBasisInv * m.Bone.GlobalBasis).GetRotationQuaternion();
-			obs.Add(relRot.X);
-			obs.Add(relRot.Y);
-			obs.Add(relRot.Z);
-			obs.Add(relRot.W);
+        Quaternion relRot = (rootBasisInv * m.Bone.GlobalBasis).GetRotationQuaternion();
+        obs.Add(relRot.X); obs.Add(relRot.Y); obs.Add(relRot.Z); obs.Add(relRot.W);
 
-			// Linear Velocity (3D): Transformed to the root's local coordinate frame
-			Vector3 locLinVel = rootBasisInv * m.Bone.LinearVelocity;
-			obs.Add(locLinVel.X);
-			obs.Add(locLinVel.Y);
-			obs.Add(locLinVel.Z);
+        Vector3 locLinVel = rootBasisInv * m.Bone.LinearVelocity;
+        obs.Add(locLinVel.X); obs.Add(locLinVel.Y); obs.Add(locLinVel.Z);
 
-			// Angular Velocity (3D): Transformed to the root's local coordinate frame
-			Vector3 locAngVel = rootBasisInv * m.Bone.AngularVelocity;
-			obs.Add(locAngVel.X);
-			obs.Add(locAngVel.Y);
-			obs.Add(locAngVel.Z);
-		}
+        Vector3 locAngVel = rootBasisInv * m.Bone.AngularVelocity;
+        obs.Add(locAngVel.X); obs.Add(locAngVel.Y); obs.Add(locAngVel.Z);
+      }
+    }
 
-		return obs.ToArray();
-	}
+    // 4. One-Hot Phase (Appended for PyTorch Extractor)
+    int phaseQuadrant = Mathf.Clamp(Mathf.FloorToInt(_gaitPhase * 4.0f), 0, 3);
+    for (int i = 0; i < 4; i++)
+    {
+        obs.Add(i == phaseQuadrant ? 1.0f : 0.0f);
+    }
+
+    return obs.ToArray();
+  }
 
 	/// <summary>
 	/// Binds the neural network's action space (a_L) to the physical joint PD controllers.
@@ -1107,97 +1198,95 @@ namespace NoCAPTheorem.Virtual
 
   public override void _PhysicsProcess(double delta)
   {
-	if (_pendingPhysicsTeleport)
-	{
-	  ExecutePhysicsTeleport();
-	  _pendingPhysicsTeleport = false;
-	}
+    if (_pendingPhysicsTeleport)
+    {
+      ExecutePhysicsTeleport();
+      _pendingPhysicsTeleport = false;
+    }
 
-	if (!_isActive || _sim == null || !_sim.Active || _hips == null) return;
+    if (!_isActive || _sim == null || !_sim.Active || _hips == null) return;
 
-	float dt = (float)delta;
-	if (_isGrabbing) UpdateGrabHandlePosition(dt);
+    float dt = (float)delta;
+    if (_isGrabbing) UpdateGrabHandlePosition(dt);
 
-	// --- UPDATED SHADOW PATHING ---
-	if (AnimationShadow != null)
-	{
-	  // Rotate the shadow around its local Y axis
-	  AnimationShadow.RotateY(ShadowTurnSpeed * dt);
+    if (dt <= 0f) return;
+    float previousPhase = _gaitPhase;
+    _gaitPhase += dt;
+    if (_gaitPhase >= 1.0f) _gaitPhase -= 1.0f;
 
-	  // Translate the shadow forward along its local -Z axis
-	  Vector3 forwardDir = -AnimationShadow.GlobalTransform.Basis.Z.Normalized();
+    // Detect step transition to generate new goals
+    if ((previousPhase < 0.5f && _gaitPhase >= 0.5f) || (previousPhase > 0.5f && _gaitPhase < 0.5f))
+    {
+      GenerateFootstepGoals();
+    }
 
-	  // Lock the Y position to 0 to prevent drifting upward or downward
-	  Vector3 newPos = AnimationShadow.GlobalPosition - (forwardDir * ShadowWalkSpeed * dt);
-	  newPos.Y = 0f;
+    if (ShadowAnimPlayer != null && ShadowAnimPlayer.HasAnimation("Walking/mixamo_com"))
+    {
+      var anim = ShadowAnimPlayer.GetAnimation("Walking/mixamo_com");
+      // Map the 0.0 -> 1.0 gait phase to the actual animation length in seconds
+      float animTime = _gaitPhase * anim.Length;
+      ShadowAnimPlayer.Seek(animTime, true);
+    }
 
-	  AnimationShadow.GlobalPosition = newPos;
-	}
-	// ------------------------------
+    _frameCounter++;
+    bool isDebugFrame = EnableDebugLogs && (_frameCounter % 60 == 0);
+    // --- 1. SENSOR EVALUATION ---
+    HashSet<int> stanceBoneIds = new HashSet<int>();
+    bool hasFootContact = false;
+    float confidenceBlendSpeed = 15.0f;
 
-	if (dt <= 0f) return;
-	_gaitPhase += dt;
-	if (_gaitPhase >= 1.0f) _gaitPhase -= 1.0f;
+    foreach (var leg in _legs)
+    {
+      if (leg.GroundSensor.IsColliding())
+      {
+        hasFootContact = true;
+        foreach (int id in leg.ChainBoneIds) stanceBoneIds.Add(id);
+        leg.GroundedConfidence = Mathf.Lerp(leg.GroundedConfidence, 1.0f, confidenceBlendSpeed * dt);
+      } else {
+        leg.GroundedConfidence = Mathf.Lerp(leg.GroundedConfidence, 0.0f, confidenceBlendSpeed * dt);
+      }
+    }
 
-	_frameCounter++;
-	bool isDebugFrame = EnableDebugLogs && (_frameCounter % 60 == 0);
-	  // --- 1. SENSOR EVALUATION ---
-	  HashSet<int> stanceBoneIds = new HashSet<int>();
-	  bool hasFootContact = false;
-	  float confidenceBlendSpeed = 15.0f;
+    // --- 2. HYSTERESIS (DEBOUNCING) ---
+    if (!hasFootContact)
+    {
+      _airborneTimer += dt;
+    }
+    else
+    {
+      _airborneTimer = 0.0f;
+    }
 
-	  foreach (var leg in _legs)
-	  {
-		if (leg.GroundSensor.IsColliding())
-		{
-		  hasFootContact = true;
-		  foreach (int id in leg.ChainBoneIds) stanceBoneIds.Add(id);
-		  leg.GroundedConfidence = Mathf.Lerp(leg.GroundedConfidence, 1.0f, confidenceBlendSpeed * dt);
-		} else {
-		  leg.GroundedConfidence = Mathf.Lerp(leg.GroundedConfidence, 0.0f, confidenceBlendSpeed * dt);
-		}
-	  }
+    // --- 3. BROADENED SENSORS & VELOCITY CHECK ---
+    float trueHeightAboveGround = TargetHeight; // Default to safe height
+    var spaceState = GetWorld3D().DirectSpaceState;
+    var query = PhysicsRayQueryParameters3D.Create(_hips.GlobalPosition,
+        _hips.GlobalPosition + (Vector3.Down * 10.0f));
+    query.CollisionMask = GroundMask; // Only detect physical floors
+    var result = spaceState.IntersectRay(query);
 
-	  // --- 2. HYSTERESIS (DEBOUNCING) ---
-	  if (!hasFootContact)
-	  {
-		_airborneTimer += dt;
-	  }
-	  else
-	  {
-		_airborneTimer = 0.0f;
-	  }
+    if (result.Count > 0)
+    {
+      float groundY = result["position"].AsVector3().Y;
+      trueHeightAboveGround = _hips.GlobalPosition.Y - groundY;
+    }
+    bool isFallen = trueHeightAboveGround < FallenHeight;
 
-	  // --- 3. BROADENED SENSORS & VELOCITY CHECK ---
-	  float trueHeightAboveGround = TargetHeight; // Default to safe height
-	  var spaceState = GetWorld3D().DirectSpaceState;
-	  var query = PhysicsRayQueryParameters3D.Create(_hips.GlobalPosition,
-		  _hips.GlobalPosition + (Vector3.Down * 10.0f));
-	  query.CollisionMask = GroundMask; // Only detect physical floors
-	  var result = spaceState.IntersectRay(query);
+    // If we lack foot contact but our vertical velocity is nearly zero,
+    // we are resting on a surface (e.g., draped over a table), not falling.
+    bool isResting = Mathf.Abs(_hips.LinearVelocity.Y) < RestingVelocityThreshold;
 
-	  if (result.Count > 0)
-	  {
-		  float groundY = result["position"].AsVector3().Y;
-		  trueHeightAboveGround = _hips.GlobalPosition.Y - groundY;
-	  }
-	  bool isFallen = trueHeightAboveGround < FallenHeight;
+    // Rigorous Airborne Definition:
+    // - Sensors disconnected longer than the hysteresis threshold.
+    // - Torso is NOT on the ground (!isFallen).
+    // - We are actually falling (!isResting).
+    bool isAirborne = (_airborneTimer >= AirborneHysteresisTime) && !isFallen && !isResting;
 
-	  // If we lack foot contact but our vertical velocity is nearly zero,
-	  // we are resting on a surface (e.g., draped over a table), not falling.
-	  bool isResting = Mathf.Abs(_hips.LinearVelocity.Y) < RestingVelocityThreshold;
-
-	  // Rigorous Airborne Definition:
-	  // - Sensors disconnected longer than the hysteresis threshold.
-	  // - Torso is NOT on the ground (!isFallen).
-	  // - We are actually falling (!isResting).
-	  bool isAirborne = (_airborneTimer >= AirborneHysteresisTime) && !isFallen && !isResting;
-
-	  // --- STATE MACHINE EXECUTION (NEURAL NETWORK READY) ---
-	  // The analytical heuristic controllers (VMC, Gyro, PD Shadow Tracking)
-	  // have been removed. The DeepLoco LLC will dictate joint targets.
-	  CompensateForGravity(dt);
-	}
+    // --- STATE MACHINE EXECUTION (NEURAL NETWORK READY) ---
+    // The analytical heuristic controllers (VMC, Gyro, PD Shadow Tracking)
+    // have been removed. The DeepLoco LLC will dictate joint targets.
+    CompensateForGravity(dt);
+  }
 
 	private void UpdateGrabHandlePosition(float delta)
 	{
