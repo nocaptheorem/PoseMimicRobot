@@ -30,20 +30,32 @@ namespace ActiveRagdollModules
       var staticBody = new StaticBody3D();
       AddChild(staticBody);
 
+      // 1. Infinite physics plane facing upward (+Y)
       var col = new CollisionShape3D();
-      col.Shape = new BoxShape3D { Size = new Vector3(20, 1, 20) };
+      col.Shape = new WorldBoundaryShape3D
+      {
+        Plane = new Plane(Vector3.Up, 0f) // Normal: (0, 1, 0), Distance: 0
+      };
       staticBody.AddChild(col);
 
+      // 2. Large visual plane with repeated texture mapping
       var mesh = new MeshInstance3D();
-      mesh.Mesh = new BoxMesh { Size = new Vector3(20, 1, 20) };
+      mesh.Mesh = new PlaneMesh
+      {
+        Size = new Vector2(4000, 4000)
+      };
+
       mesh.MaterialOverride = new StandardMaterial3D
       {
         AlbedoColor = new Color(0.2f, 0.2f, 0.2f),
         Metallic = 0.5f,
-        Roughness = 0.2f
+        Roughness = 0.2f,
+        Uv1Scale = new Vector3(1000, 1000, 1) // Keeps texture grid scale intact if a texture is added
       };
       staticBody.AddChild(mesh);
-      staticBody.Position = new Vector3(0, -0.5f, 0);
+
+      // Position at y = 0
+      staticBody.Position = Vector3.Zero;
     }
 
     private void BuildLighting()

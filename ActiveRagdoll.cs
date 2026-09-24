@@ -69,6 +69,7 @@ namespace NoCAPTheorem.Virtual
     [Export(PropertyHint.Layers3DPhysics)] public uint GroundMask = 1;
     #endregion
 
+
     #region State Evaluation Tuning
     [ExportGroup("7. State Thresholds")]
     [Export] public float AirborneHysteresisTime = 0.15f; // Seconds without foot contact before declaring airborne
@@ -76,6 +77,10 @@ namespace NoCAPTheorem.Virtual
     #endregion
 
     // --- INTERNAL STATE ---
+    private Vector3 _initialSpawnPosition;
+    private Vector3 _initialSpawnRotation;
+    private bool _needsSimulatorRestart = false;
+    private bool _pendingPhysicsTeleport = false;
     private float _airborneTimer = 0.0f;
     private float _gaitPhase = 0.0f; // Tracks the 0.0 to 1.0 gait cycle
     private bool _isActive = true;
@@ -238,6 +243,12 @@ namespace NoCAPTheorem.Virtual
 
     public override void _Ready()
     {
+      if (AnimationShadow != null)
+      {
+        _initialSpawnPosition = AnimationShadow.GlobalPosition;
+        _initialSpawnRotation = AnimationShadow.GlobalRotation;
+      }
+
       _rng.Randomize();
       SetupDebugGizmos();
       SetupFPSCamera();
@@ -321,8 +332,8 @@ namespace NoCAPTheorem.Virtual
       BuildLeg("Left", "mixamorig_LeftFoot", "mixamorig_LeftLeg", "mixamorig_LeftUpLeg");
       BuildLeg("Right", "mixamorig_RightFoot", "mixamorig_RightLeg", "mixamorig_RightUpLeg");
 
-      CallDeferred(nameof(ResetSimulation));
-      CallDeferred(nameof(InitializeEffectSystem));
+      Callable.From(StartPhysics).CallDeferred();
+      Callable.From(ResetSimulation).CallDeferred();
       if (EnableDebugLogs)
       {
           GD.Print("--- SKELETON BONE DUMP ---");
@@ -463,7 +474,14 @@ namespace NoCAPTheorem.Virtual
       }
     }
 
-    private void StartPhysics() { if (_sim != null) { _sim.Active = true; _sim.PhysicalBonesStartSimulation(); } }
+    public void StartPhysics()
+    {
+      if (_sim != null)
+      {
+        _sim.Active = true;
+        _sim.PhysicalBonesStartSimulation();
+      }
+    }
 
     private void InitializeEffectSystem()
     {
@@ -821,17 +839,70 @@ private void ToggleShadowVisibility()
       SpawnImpactText(impactPosition);
     }
 
-    private void ResetSimulation()
+    public void ResetSimulation()
     {
       if (_sim == null) return;
+
       _sim.Active = false;
-      foreach(var m in _muscles) {
+      _sim.PhysicalBonesStopSimulation(); // Release the physics server's grip
+
+      _gaitPhase = 0.0f;
+      _airborneTimer = 0.0f;
+
+      // Restore the animation shadow to the original spawn point
+      if (AnimationShadow != null)
+      {
+        AnimationShadow.GlobalPosition = _initialSpawnPosition;
+        AnimationShadow.GlobalRotation = _initialSpawnRotation;
+      }
+
+      // Move the global skeleton root back to the original spawn point
+      this.GlobalPosition = _initialSpawnPosition;
+      this.GlobalRotation = _initialSpawnRotation;
+
+      // Snap the local bone poses
+      for (int i = 0; i < GetBoneCount(); i++)
+      {
+        SetBonePosePosition(i, AnimationShadow.GetBonePosePosition(i));
+        SetBonePoseRotation(i, AnimationShadow.GetBonePoseRotation(i));
+        SetBonePoseScale(i, AnimationShadow.GetBonePoseScale(i));
+      }
+
+      // Synchronously force Godot to recalculate global matrices
+      ForceUpdateAllBoneTransforms();
+
+      // SPOOF Node3D transforms so Python's get_obs() reads a perfect standing state immediately
+      foreach (var m in _muscles)
+      {
         Transform3D t = AnimationShadow.GetBoneGlobalPose(m.BoneId);
-        PhysicsServer3D.BodySetState(m.Bone.GetRid(), PhysicsServer3D.BodyState.Transform, AnimationShadow.GlobalTransform * t);
+        Transform3D standingTransform = AnimationShadow.GlobalTransform * t;
+
+        m.Bone.GlobalTransform = standingTransform;
+        m.Bone.LinearVelocity = Vector3.Zero;
+        m.Bone.AngularVelocity = Vector3.Zero;
+      }
+
+      // Flag Phase 2 for the physics tick
+      _pendingPhysicsTeleport = true;
+    }
+
+    private void ExecutePhysicsTeleport()
+    {
+      if (_sim == null) return;
+
+      foreach (var m in _muscles)
+      {
+        // Read the spoofed transforms from Phase 1 and inject them into the unlocked Physics Server
+        Transform3D standingTransform = m.Bone.GlobalTransform;
+
+        PhysicsServer3D.BodySetState(m.Bone.GetRid(), PhysicsServer3D.BodyState.Transform, standingTransform);
         PhysicsServer3D.BodySetState(m.Bone.GetRid(), PhysicsServer3D.BodyState.LinearVelocity, Vector3.Zero);
         PhysicsServer3D.BodySetState(m.Bone.GetRid(), PhysicsServer3D.BodyState.AngularVelocity, Vector3.Zero);
       }
-      CallDeferred(nameof(StartPhysics));
+
+      // Physics states are overridden. Safe to reactivate simulator.
+      _sim.Active = true;
+      _sim.PhysicalBonesStartSimulation();
     }
 
     /// <summary>
@@ -1022,6 +1093,13 @@ private void ToggleShadowVisibility()
 
     public override void _PhysicsProcess(double delta)
     {
+      // PHASE 2: Execute the actual Physics Server teleport safely at the start of the physics tick
+      if (_pendingPhysicsTeleport)
+      {
+        ExecutePhysicsTeleport();
+        _pendingPhysicsTeleport = false;
+      }
+
       if (!_isActive || _sim == null || !_sim.Active || _hips == null) return;
 
       if (_isGrabbing) UpdateGrabHandlePosition((float)delta);
@@ -1103,13 +1181,6 @@ private void ToggleShadowVisibility()
       // The analytical heuristic controllers (VMC, Gyro, PD Shadow Tracking)
       // have been removed. The DeepLoco LLC will dictate joint targets.
       CompensateForGravity(dt);
-
-      // TODO (Phase 4): Godot RL Agents will inject the actual action tensor here.
-      // For now, we simulate a neutral zero-action array to test the PD limits.
-      int requiredActionSize = (_muscles.Count - 1) * 3;
-      float[] currentActions = new float[requiredActionSize];
-
-      ApplyActions(currentActions, dt);
 
       if (DrawDebugGizmos) DrawGizmos();
     }
@@ -1312,6 +1383,24 @@ private void ToggleShadowVisibility()
         BodyEntered -= OnBodyEntered;
         QueueFree();
       }
+    }
+
+    private void ApplyPhysicsTeleport()
+    {
+      if (_sim == null) return;
+
+      foreach (var m in _muscles)
+      {
+        // Re-read the spoofed transform and safely inject it into the unlocked Physics Server
+        Transform3D standingTransform = m.Bone.GlobalTransform;
+
+        PhysicsServer3D.BodySetState(m.Bone.GetRid(), PhysicsServer3D.BodyState.Transform, standingTransform);
+        PhysicsServer3D.BodySetState(m.Bone.GetRid(), PhysicsServer3D.BodyState.LinearVelocity, Vector3.Zero);
+        PhysicsServer3D.BodySetState(m.Bone.GetRid(), PhysicsServer3D.BodyState.AngularVelocity, Vector3.Zero);
+      }
+
+      // Safely restart the simulation constraints
+      StartPhysics();
     }
 
     private partial class AdogenProjectile : RigidBody3D
